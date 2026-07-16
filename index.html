@@ -168,6 +168,8 @@
   <div id="top-bar">
     <div id="turn-indicator" class="turn-indicator">Turn 1 &mdash; Blue's move</div>
     <div class="spacer"></div>
+    <button id="zoom-out-btn" title="Zoom out">&minus;</button>
+    <button id="zoom-in-btn" title="Zoom in">+</button>
     <button id="help-btn">Unit Guide</button>
     <button id="end-turn-btn" class="primary">End Turn</button>
   </div>
@@ -252,7 +254,9 @@
     medium: { w: 96,  h: 64 },
     large:  { w: 124, h: 96 },
   };
-  const TILE_PX = 15;
+  const MIN_TILE_PX = 12;
+  const MAX_TILE_PX = 40;
+  let TILE_PX = 26;
   const MAX_LOG = 60;
 
   /* ---------------------------------------------------------------------
@@ -491,6 +495,34 @@
     for (const k of vis) player.explored.add(k);
   }
 
+  // Marks everything within `vision` of (x,y) as explored, without touching
+  // the currently-visible set. Used to reveal fog along a unit's flight path.
+  function revealVisionAt(s, player, x, y, vision) {
+    for (let dy = -vision; dy <= vision; dy++) {
+      for (let dx = -vision; dx <= vision; dx++) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= s.w || ny >= s.h) continue;
+        if (Math.max(Math.abs(dx), Math.abs(dy)) <= vision) player.explored.add(key(nx, ny));
+      }
+    }
+  }
+
+  // Walks the `from` links left by reachableTiles to recover the tile-by-tile
+  // path from (sx,sy) to (tx,ty), in travel order (excludes the start tile).
+  function reconstructPath(reach, sx, sy, tx, ty) {
+    const path = [];
+    const startKey = key(sx, sy);
+    let k = key(tx, ty);
+    while (k !== startKey) {
+      const entry = reach.get(k);
+      if (!entry) break;
+      path.push([entry.x, entry.y]);
+      k = entry.from;
+    }
+    path.reverse();
+    return path;
+  }
+
   /* ---------------------------------------------------------------------
    * Movement / pathing
    * ------------------------------------------------------------------- */
@@ -510,6 +542,15 @@
     if (domain === 'air') return terrainAt(s, x, y) !== null;
     if (domain === 'sea') return seaPassable(s, x, y, owner);
     if (domain === 'land') return landPassable(s, x, y);
+    return false;
+  }
+
+  // A city can only build ships if at least one adjacent tile is open sea.
+  function isCoastalCity(s, city) {
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+    for (const [dx, dy] of dirs) {
+      if (terrainAt(s, city.x + dx, city.y + dy) === TILE_SEA) return true;
+    }
     return false;
   }
 
@@ -536,7 +577,7 @@
         const occupant = unitAt(s, nx, ny);
         dist.set(k, nd);
         if (!occupant) {
-          result.set(k, { x: nx, y: ny, cost: nd });
+          result.set(k, { x: nx, y: ny, cost: nd, from: key(cx, cy) });
           queue.push([nx, ny, nd]);
         }
         // occupied tiles block further passage but are not "reachable" moves
@@ -713,7 +754,16 @@
     if (!occupant) {
       const reach = reachableTiles(s, unit);
       const r = reach.get(key(tx, ty));
-      if (r) { moveUnitTo(s, unit, tx, ty, false); return true; }
+      if (r) {
+        // Reveal fog along the whole hop, not just at the landing tile --
+        // otherwise a long-range flight over unexplored ground would only
+        // uncover its destination.
+        const path = reconstructPath(reach, unit.x, unit.y, tx, ty);
+        const player = playerOf(s, unit.owner);
+        for (const [px, py] of path) revealVisionAt(s, player, px, py, def.vision);
+        moveUnitTo(s, unit, tx, ty, false);
+        return true;
+      }
     }
     return false;
   }
@@ -852,10 +902,12 @@
           ['artillery', 6], ['battleship', 4], ['carrier', 4], ['submarine', 4],
           ['helicopter', 2], ['bomber', 1],
         ];
-        const total = pickWeights.reduce((a, [, w]) => a + w, 0);
+        const coastal = isCoastalCity(s, c);
+        const available = pickWeights.filter(([k]) => coastal || UNIT_DEFS[k].domain !== 'sea');
+        const total = available.reduce((a, [, w]) => a + w, 0);
         let r = Math.random() * total;
-        let chosen = 'army';
-        for (const [k, w] of pickWeights) { if (r < w) { chosen = k; break; } r -= w; }
+        let chosen = available[0][0];
+        for (const [k, w] of available) { if (r < w) { chosen = k; break; } r -= w; }
         c.building = chosen;
         c.progress = 0;
       }
@@ -908,6 +960,85 @@
   const mctx = minimap.getContext('2d');
   const canvasWrap = document.getElementById('canvas-wrap');
 
+  // Deterministic hash used to pick among a few texture variants per tile,
+  // so the repeating terrain sprite doesn't look like an obvious checkerboard.
+  function tileVariant(x, y, n) {
+    let h = (x * 374761393 + y * 668265263) | 0;
+    h = (h ^ (h >>> 13)) * 1274126177;
+    h = h ^ (h >>> 16);
+    return (h >>> 0) % n;
+  }
+
+  function roundRectPath(ctx, x, y, w, h, radius) {
+    ctx.beginPath();
+    ctx.moveTo(x + radius, y);
+    ctx.arcTo(x + w, y, x + w, y + h, radius);
+    ctx.arcTo(x + w, y + h, x, y + h, radius);
+    ctx.arcTo(x, y + h, x, y, radius);
+    ctx.arcTo(x, y, x + w, y, radius);
+    ctx.closePath();
+  }
+
+  // Pre-rendered terrain textures. Built once at a fixed resolution and
+  // scaled to the current zoom via drawImage, so per-tile texture (gradient
+  // + speckle) costs nothing extra at render time regardless of map size.
+  const TERRAIN_SPRITE_SIZE = 48;
+  const TERRAIN_VARIANTS = 3;
+  let terrainSprites = null;
+
+  function buildTerrainSprites() {
+    function makeSprite(drawFn) {
+      const c = document.createElement('canvas');
+      c.width = TERRAIN_SPRITE_SIZE; c.height = TERRAIN_SPRITE_SIZE;
+      drawFn(c.getContext('2d'), TERRAIN_SPRITE_SIZE);
+      return c;
+    }
+    function seaTile(sctx, s, dim, seed) {
+      const g = sctx.createLinearGradient(0, 0, s, s);
+      if (dim) { g.addColorStop(0, '#484c50'); g.addColorStop(1, '#35383b'); }
+      else { g.addColorStop(0, '#1a4d78'); g.addColorStop(1, '#0b2c4d'); }
+      sctx.fillStyle = g;
+      sctx.fillRect(0, 0, s, s);
+      sctx.strokeStyle = dim ? 'rgba(255,255,255,0.05)' : 'rgba(255,255,255,0.12)';
+      sctx.lineWidth = Math.max(1, s * 0.025);
+      for (let i = 0; i < 3; i++) {
+        const yy = s * (0.2 + i * 0.3) + seed * 4;
+        sctx.beginPath();
+        sctx.moveTo(0, yy);
+        sctx.quadraticCurveTo(s * 0.25, yy - s * 0.07, s * 0.5, yy);
+        sctx.quadraticCurveTo(s * 0.75, yy + s * 0.07, s, yy);
+        sctx.stroke();
+      }
+    }
+    function landTile(sctx, s, dim, seed) {
+      const g = sctx.createLinearGradient(0, 0, s, s);
+      if (dim) { g.addColorStop(0, '#54544e'); g.addColorStop(1, '#3c3c37'); }
+      else { g.addColorStop(0, '#3f8a4c'); g.addColorStop(1, '#255c2f'); }
+      sctx.fillStyle = g;
+      sctx.fillRect(0, 0, s, s);
+      let rs = seed * 977 + 1;
+      const rand = () => { rs = (rs * 1103515245 + 12345) & 0x7fffffff; return rs / 0x7fffffff; };
+      sctx.fillStyle = dim ? 'rgba(0,0,0,0.14)' : 'rgba(0,0,0,0.12)';
+      for (let i = 0; i < 6; i++) {
+        const rx = rand() * s, ry = rand() * s, rr = s * (0.05 + rand() * 0.07);
+        sctx.beginPath(); sctx.arc(rx, ry, rr, 0, Math.PI * 2); sctx.fill();
+      }
+      sctx.fillStyle = dim ? 'rgba(255,255,255,0.03)' : 'rgba(255,255,255,0.08)';
+      for (let i = 0; i < 5; i++) {
+        const rx = rand() * s, ry = rand() * s, rr = s * (0.04 + rand() * 0.05);
+        sctx.beginPath(); sctx.arc(rx, ry, rr, 0, Math.PI * 2); sctx.fill();
+      }
+    }
+    const mk = (fn) => Array.from({ length: TERRAIN_VARIANTS }, (_, i) => makeSprite((c, s) => fn(c, s, i)));
+    terrainSprites = {
+      seaBright: mk((c, s, i) => seaTile(c, s, false, i)),
+      seaDim: mk((c, s, i) => seaTile(c, s, true, i)),
+      landBright: mk((c, s, i) => landTile(c, s, false, i)),
+      landDim: mk((c, s, i) => landTile(c, s, true, i)),
+    };
+  }
+  buildTerrainSprites();
+
   function resizeCanvas() {
     canvas.width = canvasWrap.clientWidth;
     canvas.height = canvasWrap.clientHeight;
@@ -916,11 +1047,157 @@
 
   function activePlayer() { return G.players[G.currentPlayerIndex]; }
 
+  // Zooms in/out while keeping the same map tile centered in view.
+  function setZoom(newTilePx) {
+    newTilePx = clampInt(newTilePx, MIN_TILE_PX, MAX_TILE_PX);
+    if (newTilePx === TILE_PX) return;
+    if (G) {
+      const centerX = G.camera.x + (canvas.width / TILE_PX) / 2;
+      const centerY = G.camera.y + (canvas.height / TILE_PX) / 2;
+      TILE_PX = newTilePx;
+      G.camera.x = Math.round(centerX - (canvas.width / TILE_PX) / 2);
+      G.camera.y = Math.round(centerY - (canvas.height / TILE_PX) / 2);
+      render();
+    } else {
+      TILE_PX = newTilePx;
+    }
+  }
+
   function clampCamera() {
     const tilesX = Math.floor(canvas.width / TILE_PX);
     const tilesY = Math.floor(canvas.height / TILE_PX);
     G.camera.x = clampInt(G.camera.x, 0, Math.max(0, G.w - tilesX));
     G.camera.y = clampInt(G.camera.y, 0, Math.max(0, G.h - tilesY));
+  }
+
+  // Draws a small ship-hull trapezoid (used as the base for every naval unit).
+  function drawHull(ctx, r) {
+    ctx.beginPath();
+    ctx.moveTo(-r * 0.95, r * 0.15);
+    ctx.lineTo(r * 0.95, r * 0.15);
+    ctx.lineTo(r * 0.65, r * 0.55);
+    ctx.lineTo(-r * 0.65, r * 0.55);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+  }
+
+  // Renders a small pictorial icon for a unit type, centered at (0,0) in the
+  // current transform. r is roughly half the available icon box.
+  function drawUnitGlyph(ctx, type, r) {
+    ctx.lineJoin = 'round';
+    switch (type) {
+      case 'army': {
+        // Head + shoulders, like a simple soldier silhouette.
+        ctx.beginPath();
+        ctx.arc(0, -r * 0.5, r * 0.3, 0, Math.PI * 2);
+        ctx.fill(); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-r * 0.6, r * 0.65);
+        ctx.lineTo(r * 0.6, r * 0.65);
+        ctx.lineTo(0, -r * 0.05);
+        ctx.closePath();
+        ctx.fill(); ctx.stroke();
+        break;
+      }
+      case 'artillery': {
+        // Angled cannon barrel on a low triangular carriage.
+        ctx.beginPath();
+        ctx.moveTo(-r * 0.65, r * 0.6);
+        ctx.lineTo(r * 0.65, r * 0.6);
+        ctx.lineTo(0, r * 0.05);
+        ctx.closePath();
+        ctx.fill(); ctx.stroke();
+        ctx.save();
+        ctx.rotate(-Math.PI / 4.5);
+        ctx.fillRect(-r * 0.14, -r * 1.0, r * 0.28, r * 0.95);
+        ctx.strokeRect(-r * 0.14, -r * 1.0, r * 0.28, r * 0.95);
+        ctx.restore();
+        break;
+      }
+      case 'fighter': {
+        // Slim delta/dart shape, nose pointed up.
+        ctx.beginPath();
+        ctx.moveTo(0, -r * 0.95);
+        ctx.lineTo(r * 0.55, r * 0.75);
+        ctx.lineTo(0, r * 0.35);
+        ctx.lineTo(-r * 0.55, r * 0.75);
+        ctx.closePath();
+        ctx.fill(); ctx.stroke();
+        break;
+      }
+      case 'bomber': {
+        // Wide-winged cross shape, bulkier than the fighter.
+        ctx.beginPath();
+        ctx.moveTo(0, -r * 0.9);
+        ctx.lineTo(r * 0.2, r * 0.15);
+        ctx.lineTo(r * 0.95, r * 0.55);
+        ctx.lineTo(r * 0.18, r * 0.55);
+        ctx.lineTo(0, r * 0.9);
+        ctx.lineTo(-r * 0.18, r * 0.55);
+        ctx.lineTo(-r * 0.95, r * 0.55);
+        ctx.lineTo(-r * 0.2, r * 0.15);
+        ctx.closePath();
+        ctx.fill(); ctx.stroke();
+        break;
+      }
+      case 'helicopter': {
+        // Oval body, tail boom, and a rotor bar spanning the tile.
+        ctx.beginPath();
+        ctx.ellipse(0, r * 0.15, r * 0.3, r * 0.5, 0, 0, Math.PI * 2);
+        ctx.fill(); ctx.stroke();
+        ctx.lineWidth = Math.max(1, r * 0.16);
+        ctx.beginPath();
+        ctx.moveTo(r * 0.2, r * 0.4);
+        ctx.lineTo(r * 0.9, r * 0.75);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-r * 0.95, -r * 0.55);
+        ctx.lineTo(r * 0.95, -r * 0.55);
+        ctx.stroke();
+        break;
+      }
+      case 'destroyer': {
+        drawHull(ctx, r);
+        ctx.beginPath();
+        ctx.moveTo(0, r * 0.1);
+        ctx.lineTo(0, -r * 0.75);
+        ctx.stroke();
+        break;
+      }
+      case 'submarine': {
+        // Long thin torpedo body with a small conning tower.
+        ctx.beginPath();
+        ctx.ellipse(0, 0, r * 0.9, r * 0.3, 0, 0, Math.PI * 2);
+        ctx.fill(); ctx.stroke();
+        ctx.fillRect(-r * 0.12, -r * 0.55, r * 0.24, r * 0.3);
+        ctx.strokeRect(-r * 0.12, -r * 0.55, r * 0.24, r * 0.3);
+        break;
+      }
+      case 'transport': {
+        drawHull(ctx, r);
+        ctx.fillRect(-r * 0.4, -r * 0.35, r * 0.8, r * 0.4);
+        ctx.strokeRect(-r * 0.4, -r * 0.35, r * 0.8, r * 0.4);
+        break;
+      }
+      case 'carrier': {
+        // Long flat deck with an offset island superstructure.
+        ctx.beginPath();
+        ctx.rect(-r * 0.95, -r * 0.18, r * 1.9, r * 0.36);
+        ctx.fill(); ctx.stroke();
+        ctx.fillRect(r * 0.35, -r * 0.6, r * 0.28, r * 0.42);
+        ctx.strokeRect(r * 0.35, -r * 0.6, r * 0.28, r * 0.42);
+        break;
+      }
+      case 'battleship': {
+        drawHull(ctx, r);
+        ctx.fillRect(-r * 0.55, -r * 0.1, r * 0.32, r * 0.3);
+        ctx.strokeRect(-r * 0.55, -r * 0.1, r * 0.32, r * 0.3);
+        ctx.fillRect(r * 0.23, -r * 0.1, r * 0.32, r * 0.3);
+        ctx.strokeRect(r * 0.23, -r * 0.1, r * 0.32, r * 0.3);
+        break;
+      }
+    }
   }
 
   function render() {
@@ -945,10 +1222,21 @@
         const visibleNow = player.visible.has(k);
         const terrain = terrainAt(G, x, y);
         const px = tx * TILE_PX, py = ty * TILE_PX;
-        ctx.fillStyle = terrain === TILE_LAND
-          ? (visibleNow ? '#2f6d3a' : '#17331b')
-          : (visibleNow ? '#0d2b4a' : '#081826');
-        ctx.fillRect(px, py, TILE_PX, TILE_PX);
+        const variant = tileVariant(x, y, TERRAIN_VARIANTS);
+        const sprites = terrain === TILE_LAND
+          ? (visibleNow ? terrainSprites.landBright : terrainSprites.landDim)
+          : (visibleNow ? terrainSprites.seaBright : terrainSprites.seaDim);
+        ctx.drawImage(sprites[variant], px, py, TILE_PX, TILE_PX);
+
+        // Shoreline: a sandy highlight along edges where land meets sea.
+        if (terrain === TILE_LAND) {
+          ctx.strokeStyle = visibleNow ? 'rgba(230,210,150,0.6)' : 'rgba(230,210,150,0.28)';
+          ctx.lineWidth = Math.max(1, TILE_PX * 0.12);
+          if (terrainAt(G, x - 1, y) !== TILE_LAND) { ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px, py + TILE_PX); ctx.stroke(); }
+          if (terrainAt(G, x + 1, y) !== TILE_LAND) { ctx.beginPath(); ctx.moveTo(px + TILE_PX, py); ctx.lineTo(px + TILE_PX, py + TILE_PX); ctx.stroke(); }
+          if (terrainAt(G, x, y - 1) !== TILE_LAND) { ctx.beginPath(); ctx.moveTo(px, py); ctx.lineTo(px + TILE_PX, py); ctx.stroke(); }
+          if (terrainAt(G, x, y + 1) !== TILE_LAND) { ctx.beginPath(); ctx.moveTo(px, py + TILE_PX); ctx.lineTo(px + TILE_PX, py + TILE_PX); ctx.stroke(); }
+        }
       }
     }
 
@@ -960,18 +1248,46 @@
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
       const visibleNow = player.visible.has(k);
-      ctx.fillStyle = c.owner === 'p1' ? '#3b82f6' : c.owner === 'p2' ? '#e0453b' : '#c9a227';
+      const flagColor = c.owner === 'p1' ? '#3b82f6' : c.owner === 'p2' ? '#e0453b' : '#c9a227';
+      const r = TILE_PX * 0.42;
+      ctx.save();
+      ctx.translate(px + TILE_PX / 2, py + TILE_PX / 2);
       ctx.globalAlpha = visibleNow ? 1 : 0.55;
+      // Ground mound shadow.
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
       ctx.beginPath();
-      ctx.arc(px + TILE_PX/2, py + TILE_PX/2, TILE_PX*0.38, 0, Math.PI*2);
+      ctx.ellipse(0, r * 0.6, r * 0.6, r * 0.24, 0, 0, Math.PI * 2);
       ctx.fill();
+      // Pole.
+      ctx.strokeStyle = '#4a3826';
+      ctx.lineWidth = Math.max(1, TILE_PX * 0.09);
+      ctx.beginPath();
+      ctx.moveTo(0, r * 0.65); ctx.lineTo(0, -r * 0.9);
+      ctx.stroke();
+      // Flag.
+      ctx.fillStyle = flagColor;
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(0, -r * 0.9);
+      ctx.lineTo(r * 0.8, -r * 0.62);
+      ctx.lineTo(0, -r * 0.32);
+      ctx.closePath();
+      ctx.fill(); ctx.stroke();
       ctx.globalAlpha = 1;
+      ctx.restore();
       if (visibleNow && c.owner === player.id && c.building) {
         ctx.strokeStyle = '#fff';
         ctx.lineWidth = 1;
         const need = UNIT_DEFS[c.building].buildTurns;
         const frac = Math.min(1, c.progress / need);
         ctx.strokeRect(px+1, py + TILE_PX - 3, (TILE_PX-2) * frac, 2);
+      }
+      if (G.selectedCityId === c.id) {
+        roundRectPath(ctx, px + 1, py + 1, TILE_PX - 2, TILE_PX - 2, Math.max(2, TILE_PX * 0.18));
+        ctx.strokeStyle = '#f2c14e';
+        ctx.lineWidth = 2;
+        ctx.stroke();
       }
     }
 
@@ -985,16 +1301,40 @@
       const tx = u.x - G.camera.x, ty = u.y - G.camera.y;
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
-      ctx.fillStyle = u.owner === 'p1' ? '#3b82f6' : '#e0453b';
-      ctx.fillRect(px + 2, py + 2, TILE_PX - 4, TILE_PX - 4);
-      ctx.strokeStyle = (G.selectedUnitId === u.id) ? '#f2c14e' : '#000';
+      const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
+      const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
+      const chipGrad = ctx.createLinearGradient(px + 2, py + 2, px + TILE_PX - 2, py + TILE_PX - 2);
+      chipGrad.addColorStop(0, light);
+      chipGrad.addColorStop(1, dark);
+      roundRectPath(ctx, px + 2, py + 2, TILE_PX - 4, TILE_PX - 4, Math.max(2, TILE_PX * 0.18));
+      ctx.fillStyle = chipGrad;
+      ctx.fill();
+      ctx.strokeStyle = (G.selectedUnitId === u.id) ? '#f2c14e' : 'rgba(0,0,0,0.65)';
       ctx.lineWidth = (G.selectedUnitId === u.id) ? 2 : 1;
-      ctx.strokeRect(px + 2, py + 2, TILE_PX - 4, TILE_PX - 4);
-      ctx.fillStyle = '#fff';
-      ctx.font = 'bold 10px monospace';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(UNIT_DEFS[u.type].symbol, px + TILE_PX/2, py + TILE_PX/2 + 1);
+      ctx.stroke();
+      ctx.save();
+      ctx.translate(px + TILE_PX / 2, py + TILE_PX / 2);
+      // Soft drop shadow beneath the glyph for a slight embossed look.
+      ctx.save();
+      ctx.translate(TILE_PX * 0.05, TILE_PX * 0.07);
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+      drawUnitGlyph(ctx, u.type, TILE_PX * 0.42);
+      ctx.restore();
+      const iconGrad = ctx.createLinearGradient(-TILE_PX * 0.42, -TILE_PX * 0.42, TILE_PX * 0.42, TILE_PX * 0.42);
+      iconGrad.addColorStop(0, '#ffffff');
+      iconGrad.addColorStop(1, '#c7ced6');
+      ctx.fillStyle = iconGrad;
+      ctx.strokeStyle = '#16181c';
+      ctx.lineWidth = 1;
+      drawUnitGlyph(ctx, u.type, TILE_PX * 0.42);
+      ctx.restore();
+      if (u.veteran) {
+        ctx.fillStyle = '#f2c14e';
+        ctx.beginPath();
+        ctx.arc(px + TILE_PX - 3, py + 3, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
 
     // Selection overlays: reachable & attackable tiles
@@ -1101,11 +1441,14 @@
     html += `<label style="font-size:11px;color:var(--dim);">Producing:</label>`;
     html += `<select id="city-build-select" style="width:100%;margin-top:4px;">`;
     html += `<option value="">(idle)</option>`;
+    const coastal = isCoastalCity(G, c);
     for (const uk of UNIT_ORDER) {
       const d = UNIT_DEFS[uk];
+      if (d.domain === 'sea' && !coastal) continue;
       html += `<option value="${uk}" ${c.building === uk ? 'selected' : ''}>${d.name} (${d.buildTurns}t)</option>`;
     }
     html += `</select>`;
+    if (!coastal) html += `<div style="font-size:11px;color:var(--dim);margin-top:4px;">Land-locked: ships unavailable.</div>`;
     if (c.building) {
       const need = UNIT_DEFS[c.building].buildTurns;
       html += `<div style="font-size:11px;color:var(--dim);margin-top:6px;">Progress: ${c.progress} / ${need} turns</div>`;
@@ -1216,6 +1559,14 @@
   window.addEventListener('mouseup', () => { dragging = false; });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
+  canvas.addEventListener('wheel', (e) => {
+    if (!G) return;
+    e.preventDefault();
+    setZoom(TILE_PX + (e.deltaY < 0 ? 2 : -2));
+  }, { passive: false });
+  document.getElementById('zoom-in-btn').addEventListener('click', () => setZoom(TILE_PX + 4));
+  document.getElementById('zoom-out-btn').addEventListener('click', () => setZoom(TILE_PX - 4));
+
   window.addEventListener('keydown', (e) => {
     if (!G || document.getElementById('game-screen').style.display === 'none') return;
     const step = 3;
@@ -1224,6 +1575,8 @@
     else if (e.key === 'ArrowLeft' || e.key === 'a') { G.camera.x -= step; render(); }
     else if (e.key === 'ArrowRight' || e.key === 'd') { G.camera.x += step; render(); }
     else if (e.key === 'Escape') { G.selectedUnitId = null; G.selectedCityId = null; render(); renderSelection(); }
+    else if (e.key === '+' || e.key === '=') { setZoom(TILE_PX + 4); }
+    else if (e.key === '-' || e.key === '_') { setZoom(TILE_PX - 4); }
   });
 
   document.getElementById('end-turn-btn').addEventListener('click', () => {
