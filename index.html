@@ -646,6 +646,7 @@
       log(s, `${nameOf(unit)} captured ${wasNeutral ? 'a neutral' : 'an enemy'} city!`, true);
       checkWinCondition(s);
     }
+    recomputeVisibility(s, playerOf(s, unit.owner));
   }
 
   // Finds a tile to place a freshly-built unit: the city tile itself if free,
@@ -686,6 +687,7 @@
       unit.cargo.push(occupant);
       unit.movesLeft = Math.max(0, unit.movesLeft - 1);
       log(s, `${nameOf(occupant)} boarded ${nameOf(unit)}.`);
+      recomputeVisibility(s, playerOf(s, unit.owner));
       return true;
     }
 
@@ -701,6 +703,8 @@
       const c = cityAt(s, tx, ty);
       if (c && UNIT_DEFS[cargoUnit.type].canCapture && c.owner !== cargoUnit.owner) {
         moveUnitTo(s, cargoUnit, tx, ty, true);
+      } else {
+        recomputeVisibility(s, playerOf(s, unit.owner));
       }
       return true;
     }
