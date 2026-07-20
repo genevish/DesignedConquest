@@ -1372,12 +1372,11 @@
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
       // For the side whose turn it is, make it obvious at a glance which of
-      // their units are done for the turn (dimmed) vs. still have an action
-      // available (a bright "ready" dot).
+      // their units still have an action available (green dot) vs. are done
+      // for the turn (red dot).
       const trackTurnState = u.owner === player.id && player.kind === 'human';
       const hasActionsLeft = u.movesLeft > 0 || u.attacksLeft > 0;
       ctx.save();
-      if (trackTurnState && !hasActionsLeft) ctx.globalAlpha = 0.45;
       const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
       const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
       const chipGrad = ctx.createLinearGradient(px + 2, py + 2, px + TILE_PX - 2, py + TILE_PX - 2);
@@ -1413,8 +1412,8 @@
         ctx.fill();
       }
       ctx.restore();
-      if (trackTurnState && hasActionsLeft) {
-        ctx.fillStyle = '#3ddc71';
+      if (trackTurnState) {
+        ctx.fillStyle = hasActionsLeft ? '#3ddc71' : '#e0453b';
         ctx.strokeStyle = 'rgba(0,0,0,0.7)';
         ctx.lineWidth = 1;
         ctx.beginPath();
