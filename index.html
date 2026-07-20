@@ -237,9 +237,9 @@
   const UNIT_DEFS = {
     army:       { key:'army',       name:'Army',       symbol:'A', domain:'land', move:1, attack:2,  hp:2, range:1, vision:1, buildTurns:4,  fuel:0, capacity:0, cargoType:null, canCapture:true, attacksPerTurn:1 },
     artillery:  { key:'artillery',  name:'Artillery',  symbol:'R', domain:'land', move:1, attack:4,  hp:2, range:2, vision:1, buildTurns:8,  fuel:0, capacity:0, cargoType:null, canCapture:true, attacksPerTurn:2, noCounter:true },
-    fighter:    { key:'fighter',    name:'Fighter',    symbol:'F', domain:'air',  move:8, attack:3,  hp:1, range:1, vision:3, buildTurns:6,  fuel:10, capacity:0, cargoType:null, veteranCapable:true, attacksPerTurn:1 },
-    helicopter: { key:'helicopter', name:'Helicopter', symbol:'H', domain:'air',  move:6, attack:5,  hp:2, range:1, vision:2, buildTurns:10, fuel:8, capacity:0, cargoType:null, veteranCapable:true, attacksPerTurn:1 },
-    bomber:     { key:'bomber',     name:'Bomber',     symbol:'B', domain:'air',  move:4, attack:10, hp:1, range:1, vision:2, buildTurns:14, fuel:6, capacity:0, cargoType:null, singleUse:true, attacksPerTurn:1 },
+    fighter:    { key:'fighter',    name:'Fighter',    symbol:'F', domain:'air',  move:8, attack:3,  hp:1, range:1, vision:3, buildTurns:6,  fuel:20, capacity:0, cargoType:null, veteranCapable:true, attacksPerTurn:1 },
+    helicopter: { key:'helicopter', name:'Helicopter', symbol:'H', domain:'air',  move:6, attack:5,  hp:2, range:1, vision:2, buildTurns:10, fuel:20, capacity:0, cargoType:null, veteranCapable:true, attacksPerTurn:1 },
+    bomber:     { key:'bomber',     name:'Bomber',     symbol:'B', domain:'air',  move:4, attack:10, hp:1, range:1, vision:2, buildTurns:14, fuel:20, capacity:0, cargoType:null, singleUse:true, attacksPerTurn:1 },
     destroyer:  { key:'destroyer',  name:'Destroyer',  symbol:'D', domain:'sea',  move:4, attack:3,  hp:3, range:1, vision:2, buildTurns:6,  fuel:0, capacity:0, cargoType:null, detectsSubs:true, attacksPerTurn:1 },
     submarine:  { key:'submarine',  name:'Submarine',  symbol:'S', domain:'sea',  move:3, attack:4,  hp:2, range:1, vision:1, buildTurns:8,  fuel:0, capacity:0, cargoType:null, stealth:true, attacksPerTurn:1 },
     transport:  { key:'transport',  name:'Transport',  symbol:'T', domain:'sea',  move:3, attack:0,  hp:1, range:1, vision:1, buildTurns:5,  fuel:0, capacity:3, cargoType:'land', attacksPerTurn:1 },
@@ -340,6 +340,55 @@
     return components;
   }
 
+  function isCoastalTile(land, w, h, x, y) {
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+    for (const [dx, dy] of dirs) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+      if (!land[ny][nx]) return true;
+    }
+    return false;
+  }
+
+  // Picks well-spaced city sites within one landmass: rejection-sampled
+  // against a minimum spacing (relaxed gradually if it can't be met),
+  // kept off the outer 2-tile edge margin, and nudged to include at least
+  // one coastal site so the landmass can always build/receive ships.
+  function placeCitiesInComponent(land, w, h, comp, numCities) {
+    const validTiles = comp.filter(([x, y]) => x >= 2 && y >= 2 && x <= w - 3 && y <= h - 3);
+    if (validTiles.length === 0) return [];
+    const want = Math.min(numCities, validTiles.length);
+    const chosen = [];
+    let minSpacing = Math.max(3, Math.sqrt(validTiles.length / want) * 0.9);
+    let guard = 0;
+    while (chosen.length < want && guard < 4000) {
+      guard++;
+      const [cx, cy] = validTiles[randInt(validTiles.length)];
+      const farEnough = chosen.every(c => Math.max(Math.abs(c.x - cx), Math.abs(c.y - cy)) >= minSpacing);
+      const dup = chosen.some(c => c.x === cx && c.y === cy);
+      if (farEnough && !dup) chosen.push({ x: cx, y: cy });
+      else if (guard % 200 === 0 && minSpacing > 1) minSpacing -= 1;
+    }
+    if (chosen.length > 0 && !chosen.some(c => isCoastalTile(land, w, h, c.x, c.y))) {
+      const coastalCandidates = validTiles.filter(([x, y]) => isCoastalTile(land, w, h, x, y));
+      if (coastalCandidates.length > 0) {
+        // Swap out the last-placed city, picking whichever coastal tile
+        // stays farthest from the others so the coastal guarantee doesn't
+        // undo the spacing pass above.
+        const others = chosen.slice(0, -1);
+        let best = coastalCandidates[0], bestMinD = -1;
+        for (const [cx, cy] of coastalCandidates) {
+          const minD = others.length
+            ? Math.min(...others.map(o => Math.max(Math.abs(o.x - cx), Math.abs(o.y - cy))))
+            : Infinity;
+          if (minD > bestMinD) { bestMinD = minD; best = [cx, cy]; }
+        }
+        chosen[chosen.length - 1] = { x: best[0], y: best[1] };
+      }
+    }
+    return chosen;
+  }
+
   function buildMap(sizeKey, landKey) {
     const { w, h } = MAP_SIZES[sizeKey];
     const frac = LAND_FRACTIONS[landKey];
@@ -353,16 +402,9 @@
       let cid = 0;
       for (const comp of components) {
         const numCities = clampInt(Math.round(comp.length / 55), 1, 8);
-        const chosen = new Set();
-        let tries = 0;
-        while (chosen.size < numCities && tries < numCities * 20) {
-          tries++;
-          const idx = randInt(comp.length);
-          chosen.add(idx);
-        }
-        for (const idx of chosen) {
-          const [cx, cy] = comp[idx];
-          cities.push({ id: cid++, x: cx, y: cy, owner: 'neutral', building: null, progress: 0 });
+        const sites = placeCitiesInComponent(land, w, h, comp, numCities);
+        for (const { x: cx, y: cy } of sites) {
+          cities.push({ id: cid++, x: cx, y: cy, owner: 'neutral', building: 'army', progress: 0 });
         }
       }
       if (cities.length < 2) continue;
@@ -395,8 +437,8 @@
       for (let x = 0; x < w; x++) terrain[y][x] = true;
     }
     const cities = [
-      { id: 0, x: Math.floor(w*0.1), y: Math.floor(h*0.5), owner: 'p1', building: null, progress: 0 },
-      { id: 1, x: Math.floor(w*0.9), y: Math.floor(h*0.5), owner: 'p2', building: null, progress: 0 },
+      { id: 0, x: Math.floor(w*0.1), y: Math.floor(h*0.5), owner: 'p1', building: 'army', progress: 0 },
+      { id: 1, x: Math.floor(w*0.9), y: Math.floor(h*0.5), owner: 'p2', building: 'army', progress: 0 },
     ];
     return { w, h, terrain, cities };
   }
@@ -666,17 +708,45 @@
     return `${side} ${def.name}${unit.veteran ? ' (Vet)' : ''}`;
   }
 
+  // A tile that lets an aircraft top off its fuel: a friendly city, or a
+  // friendly carrier (which counts even if the plane just flies over it).
+  function isRefuelTile(s, x, y, owner) {
+    const c = cityAt(s, x, y);
+    if (c && c.owner === owner) return true;
+    const u = unitAt(s, x, y);
+    if (u && u.owner === owner && UNIT_DEFS[u.type].cargoType === 'air') return true;
+    return false;
+  }
+
   /* ---------------------------------------------------------------------
    * Movement execution (handles capture / load / unload)
    * ------------------------------------------------------------------- */
-  function moveUnitTo(s, unit, x, y, freeOfCost) {
+  // `path`, if given, is the ordered list of tiles ([x,y] pairs) actually
+  // flown over this hop -- used so a plane refuels if it passes over a
+  // friendly city/carrier mid-flight, not only when it lands on one.
+  function moveUnitTo(s, unit, x, y, freeOfCost, path) {
     const def = UNIT_DEFS[unit.type];
+    let steps = 0;
     if (!freeOfCost) {
       const dx = Math.abs(unit.x - x), dy = Math.abs(unit.y - y);
-      const steps = Math.max(dx, dy);
+      steps = Math.max(dx, dy);
       unit.movesLeft = Math.max(0, unit.movesLeft - steps);
     }
     unit.x = x; unit.y = y;
+
+    if (def.fuel > 0 && steps > 0) {
+      const tiles = (path && path.length) ? path : [[x, y]];
+      const refueled = tiles.some(([px, py]) => isRefuelTile(s, px, py, unit.owner));
+      if (refueled) {
+        unit.fuel = def.fuel;
+      } else {
+        unit.fuel -= steps;
+        if (unit.fuel < 0) {
+          log(s, `${nameOf(unit)} ran out of fuel and crashed!`, true);
+          destroyUnit(s, unit);
+        }
+      }
+    }
 
     const c = cityAt(s, x, y);
     if (c && def.canCapture && c.owner !== unit.owner) {
@@ -727,6 +797,8 @@
       occupant.embarked = true;
       unit.cargo.push(occupant);
       unit.movesLeft = Math.max(0, unit.movesLeft - 1);
+      // Landing on a carrier tops off an aircraft's fuel.
+      if (def.cargoType === 'air') occupant.fuel = UNIT_DEFS[occupant.type].fuel;
       log(s, `${nameOf(occupant)} boarded ${nameOf(unit)}.`);
       recomputeVisibility(s, playerOf(s, unit.owner));
       return true;
@@ -740,6 +812,8 @@
       cargoUnit.x = tx; cargoUnit.y = ty;
       cargoUnit.movesLeft = 0;
       unit.movesLeft = Math.max(0, unit.movesLeft - 1);
+      // Launching from a carrier gives the aircraft a full tank.
+      if (def.cargoType === 'air') cargoUnit.fuel = UNIT_DEFS[cargoUnit.type].fuel;
       log(s, `${nameOf(cargoUnit)} disembarked from ${nameOf(unit)}.`);
       const c = cityAt(s, tx, ty);
       if (c && UNIT_DEFS[cargoUnit.type].canCapture && c.owner !== cargoUnit.owner) {
@@ -761,7 +835,7 @@
         const path = reconstructPath(reach, unit.x, unit.y, tx, ty);
         const player = playerOf(s, unit.owner);
         for (const [px, py] of path) revealVisionAt(s, player, px, py, def.vision);
-        moveUnitTo(s, unit, tx, ty, false);
+        moveUnitTo(s, unit, tx, ty, false, path);
         return true;
       }
     }
@@ -795,17 +869,10 @@
       const def = UNIT_DEFS[u.type];
       const onFriendlyCity = (() => { const c = cityAt(s, u.x, u.y); return c && c.owner === u.owner; })();
       if (u.hp < def.hp && onFriendlyCity) u.hp += 1;
-      if (def.fuel > 0) {
-        if (onFriendlyCity) { u.fuel = def.fuel; }
-        else {
-          u.fuel -= 1;
-          if (u.fuel < 0) {
-            log(s, `${nameOf(u)} ran out of fuel and crashed!`, true);
-            destroyUnit(s, u);
-            continue;
-          }
-        }
-      }
+      // Fuel is spent per tile flown (see moveUnitTo) and refuels on a
+      // friendly city or carrier; parking on a friendly city also tops it
+      // off directly here in case it wasn't refueled by the move itself.
+      if (def.fuel > 0 && onFriendlyCity) u.fuel = def.fuel;
       u.movesLeft = def.move;
       u.attacksLeft = def.attacksPerTurn;
     }
@@ -945,7 +1012,10 @@
             const d = chebyshev(r.x, r.y, target.x, target.y);
             if (d < bestD) { bestD = d; best = r; }
           }
-          if (best) moveUnitTo(s, unit, best.x, best.y, false);
+          if (best) {
+            const path = reconstructPath(reach, unit.x, unit.y, best.x, best.y);
+            moveUnitTo(s, unit, best.x, best.y, false, path);
+          }
         }
       }
     }
@@ -1301,6 +1371,13 @@
       const tx = u.x - G.camera.x, ty = u.y - G.camera.y;
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
+      // For the side whose turn it is, make it obvious at a glance which of
+      // their units are done for the turn (dimmed) vs. still have an action
+      // available (a bright "ready" dot).
+      const trackTurnState = u.owner === player.id && player.kind === 'human';
+      const hasActionsLeft = u.movesLeft > 0 || u.attacksLeft > 0;
+      ctx.save();
+      if (trackTurnState && !hasActionsLeft) ctx.globalAlpha = 0.45;
       const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
       const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
       const chipGrad = ctx.createLinearGradient(px + 2, py + 2, px + TILE_PX - 2, py + TILE_PX - 2);
@@ -1334,6 +1411,16 @@
         ctx.beginPath();
         ctx.arc(px + TILE_PX - 3, py + 3, 1.6, 0, Math.PI * 2);
         ctx.fill();
+      }
+      ctx.restore();
+      if (trackTurnState && hasActionsLeft) {
+        ctx.fillStyle = '#3ddc71';
+        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.arc(px + 3, py + TILE_PX - 3, Math.max(1.6, TILE_PX * 0.07), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
       }
     }
 
