@@ -171,7 +171,7 @@
     <button id="zoom-out-btn" title="Zoom out">&minus;</button>
     <button id="zoom-in-btn" title="Zoom in">+</button>
     <button id="help-btn">Unit Guide</button>
-    <button id="end-turn-btn" class="primary">End Turn</button>
+    <button id="end-turn-btn" class="primary" title="End Turn (Enter)">End Turn</button>
   </div>
   <div id="main-area">
     <div id="canvas-wrap">
@@ -1372,10 +1372,12 @@
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
       // For the side whose turn it is, make it obvious at a glance which of
-      // their units still have an action available (green dot) vs. are done
-      // for the turn (red dot).
+      // their units can still do something useful this turn (green dot) vs.
+      // are truly done (red dot): out of moves, and either out of attacks or
+      // with no enemy actually in range to attack.
       const trackTurnState = u.owner === player.id && player.kind === 'human';
-      const hasActionsLeft = u.movesLeft > 0 || u.attacksLeft > 0;
+      const canStillAttack = u.attacksLeft > 0 && attackableTargets(G, u).length > 0;
+      const hasActionsLeft = u.movesLeft > 0 || canStillAttack;
       ctx.save();
       const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
       const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
@@ -1655,6 +1657,7 @@
 
   window.addEventListener('keydown', (e) => {
     if (!G || document.getElementById('game-screen').style.display === 'none') return;
+    if (document.activeElement && ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
     const step = 3;
     if (e.key === 'ArrowUp' || e.key === 'w') { G.camera.y -= step; render(); }
     else if (e.key === 'ArrowDown' || e.key === 's') { G.camera.y += step; render(); }
@@ -1663,9 +1666,10 @@
     else if (e.key === 'Escape') { G.selectedUnitId = null; G.selectedCityId = null; render(); renderSelection(); }
     else if (e.key === '+' || e.key === '=') { setZoom(TILE_PX + 4); }
     else if (e.key === '-' || e.key === '_') { setZoom(TILE_PX - 4); }
+    else if (e.key === 'Enter') { e.preventDefault(); endTurn(); }
   });
 
-  document.getElementById('end-turn-btn').addEventListener('click', () => {
+  function endTurn() {
     if (!G || G.gameOver) return;
     const finishingPlayer = activePlayer();
     advanceToNextPlayer(G);
@@ -1676,7 +1680,9 @@
     } else {
       finishTurnUI();
     }
-  });
+  }
+
+  document.getElementById('end-turn-btn').addEventListener('click', endTurn);
 
   function finishTurnUI() {
     updateTurnIndicator();
