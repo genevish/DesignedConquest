@@ -359,7 +359,7 @@
     if (validTiles.length === 0) return [];
     const want = Math.min(numCities, validTiles.length);
     const chosen = [];
-    let minSpacing = Math.max(3, Math.sqrt(validTiles.length / want) * 0.9);
+    let minSpacing = Math.max(2, Math.sqrt(validTiles.length / want) * 0.75);
     let guard = 0;
     while (chosen.length < want && guard < 4000) {
       guard++;
@@ -401,7 +401,7 @@
       const cities = [];
       let cid = 0;
       for (const comp of components) {
-        const numCities = clampInt(Math.round(comp.length / 55), 1, 8);
+        const numCities = clampInt(Math.round(comp.length / 30), 1, 14);
         const sites = placeCitiesInComponent(land, w, h, comp, numCities);
         for (const { x: cx, y: cy } of sites) {
           cities.push({ id: cid++, x: cx, y: cy, owner: 'neutral', building: 'army', progress: 0 });
@@ -466,10 +466,16 @@
       patrolPickUnitId: null,
       gameOver: false,
     };
-    // Starting garrison: one Army in each player's home city.
+    // Starting garrison: one Army in each player's home city. Human-owned
+    // home cities start idle so the player picks their own opening
+    // production instead of it defaulting to Army.
     for (const c of state.cities) {
       if (c.owner === 'p1' || c.owner === 'p2') {
         spawnUnit(state, 'army', c.owner, c.x, c.y);
+        if (playerOf(state, c.owner).kind === 'human') {
+          c.building = null;
+          c.progress = 0;
+        }
       }
     }
     return state;
@@ -1858,6 +1864,7 @@
         punit.moveOrder = null;
         punit.patrol = { a: { x: punit.x, y: punit.y }, b: { x, y }, heading: 'b' };
         log(G, `${nameOf(punit)} set to patrol.`);
+        stepPatrol(G, punit);
       }
       render(); renderSelection(); renderLog();
       return;
@@ -1927,6 +1934,18 @@
   // making progress on its own once moves are available.
   function handleUnitDragDrop(unitId, tx, ty) {
     const player = activePlayer();
+    if (G.patrolPickUnitId != null) {
+      const punit = G.units.find(u => u.id === G.patrolPickUnitId);
+      G.patrolPickUnitId = null;
+      if (punit) {
+        punit.moveOrder = null;
+        punit.patrol = { a: { x: punit.x, y: punit.y }, b: { x: tx, y: ty }, heading: 'b' };
+        log(G, `${nameOf(punit)} set to patrol.`);
+        stepPatrol(G, punit);
+      }
+      render(); renderSelection(); renderLog();
+      return;
+    }
     const unit = G.units.find(u => u.id === unitId);
     if (!unit || unit.owner !== player.id) return;
     if (unit.x === tx && unit.y === ty) return;
@@ -2030,11 +2049,6 @@
   });
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-  canvas.addEventListener('wheel', (e) => {
-    if (!G) return;
-    e.preventDefault();
-    setZoom(TILE_PX + (e.deltaY < 0 ? 2 : -2));
-  }, { passive: false });
   document.getElementById('zoom-in-btn').addEventListener('click', () => setZoom(TILE_PX + 4));
   document.getElementById('zoom-out-btn').addEventListener('click', () => setZoom(TILE_PX - 4));
 
@@ -2150,6 +2164,10 @@
     resizeCanvas();
     beginTurnProcessing(G, G.players[0]);
     log(G, 'Game started. Good luck, Commander.', true);
+    // Auto-select the player's home city so they're prompted to choose its
+    // opening production instead of it silently defaulting to Army.
+    const homeCity = G.cities.find(c => c.owner === 'p1');
+    if (homeCity) G.selectedCityId = homeCity.id;
     updateTurnIndicator();
     render(); renderSelection(); renderLog();
   });
