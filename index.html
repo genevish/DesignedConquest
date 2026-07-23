@@ -758,6 +758,24 @@
   // friendly city/carrier mid-flight, not only when it lands on one.
   function moveUnitTo(s, unit, x, y, freeOfCost, path) {
     const def = UNIT_DEFS[unit.type];
+    // A transport/carrier leaving a friendly city it's docked beside auto-
+    // boards any of its owner's matching idle units still garrisoned there,
+    // so the player doesn't have to load them in a separate step first.
+    if (def.capacity > 0 && unit.cargo.length < def.capacity && (unit.x !== x || unit.y !== y)) {
+      const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+      for (const [dx, dy] of dirs) {
+        const c = cityAt(s, unit.x + dx, unit.y + dy);
+        if (!c || c.owner !== unit.owner) continue;
+        const waiting = unitsAt(s, c.x, c.y).filter(w => w.owner === unit.owner && !w.embarked && UNIT_DEFS[w.type].domain === def.cargoType);
+        for (const w of waiting) {
+          if (unit.cargo.length >= def.capacity) break;
+          w.embarked = true;
+          unit.cargo.push(w);
+          if (def.cargoType === 'air') w.fuel = UNIT_DEFS[w.type].fuel;
+          log(s, `${nameOf(w)} boarded ${nameOf(unit)} as it departed.`);
+        }
+      }
+    }
     let steps = 0;
     if (!freeOfCost) {
       const dx = Math.abs(unit.x - x), dy = Math.abs(unit.y - y);
@@ -839,6 +857,24 @@
       // Landing on a carrier tops off an aircraft's fuel.
       if (def.cargoType === 'air') cargoCandidate.fuel = UNIT_DEFS[cargoCandidate.type].fuel;
       log(s, `${nameOf(cargoCandidate)} boarded ${nameOf(unit)}.`);
+      recomputeVisibility(s, playerOf(s, unit.owner));
+      return true;
+    }
+
+    // 2b) Board a friendly transport/carrier standing on an adjacent tile --
+    // the reverse gesture from #2 (dragging the cargo unit itself onto the
+    // carrier instead of the carrier onto it).
+    const carrierCandidate = def.capacity === 0 && dist === 1
+      ? unitsAt(s, tx, ty).find(u => u.owner === unit.owner && UNIT_DEFS[u.type].capacity > 0 &&
+          UNIT_DEFS[u.type].cargoType === def.domain && u.cargo.length < UNIT_DEFS[u.type].capacity)
+      : null;
+    if (carrierCandidate) {
+      unit.embarked = true;
+      carrierCandidate.cargo.push(unit);
+      unit.movesLeft = Math.max(0, unit.movesLeft - 1);
+      // Boarding a carrier tops off an aircraft's fuel.
+      if (def.domain === 'air') unit.fuel = def.fuel;
+      log(s, `${nameOf(unit)} boarded ${nameOf(carrierCandidate)}.`);
       recomputeVisibility(s, playerOf(s, unit.owner));
       return true;
     }
