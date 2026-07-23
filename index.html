@@ -1870,61 +1870,36 @@
       return;
     }
 
-    if (G.selectedUnitId == null) {
-      if (occupant && occupant.owner === player.id) {
-        G.selectedUnitId = occupant.id;
-        G.selectedCityId = null;
-      } else if (cityHere && cityHere.owner === player.id) {
-        G.selectedCityId = cityHere.id;
-        G.selectedUnitId = null;
-      } else {
-        G.selectedUnitId = null;
-        G.selectedCityId = null;
-      }
-      render(); renderSelection();
-      return;
-    }
-
-    const unit = G.units.find(u => u.id === G.selectedUnitId);
-    if (!unit) { G.selectedUnitId = null; render(); renderSelection(); return; }
-
-    if (unit.x === x && unit.y === y) {
-      // A stacked city cycles through its garrison on repeated clicks
-      // instead of immediately deselecting (Escape still deselects outright).
-      const stackHere = unitsAt(G, x, y).filter(u => u.owner === player.id);
-      if (stackHere.length > 1) {
-        const idx = stackHere.findIndex(u => u.id === unit.id);
-        G.selectedUnitId = stackHere[(idx + 1) % stackHere.length].id;
-      } else {
-        G.selectedUnitId = null;
-      }
-      render(); renderSelection();
-      return;
-    }
-
-    const stackAtTarget = unitsAt(G, x, y);
-    const embarkCandidate = stackAtTarget.some(u => u.owner === player.id && UNIT_DEFS[u.type].domain === UNIT_DEFS[unit.type].cargoType);
-    if (!embarkCandidate) {
-      const other = stackAtTarget.find(u => u.owner === player.id);
-      if (other) {
-        // Switch selection to the other friendly unit instead of acting.
-        G.selectedUnitId = other.id;
+    // A click never moves, attacks, or embarks a unit -- that's drag-only
+    // (see handleUnitDragDrop). A click only selects: re-clicking the
+    // selected unit's own (possibly stacked) tile cycles its garrison,
+    // and clicking anywhere else just selects whatever's there instead.
+    if (G.selectedUnitId != null) {
+      const unit = G.units.find(u => u.id === G.selectedUnitId);
+      if (unit && unit.x === x && unit.y === y) {
+        const stackHere = unitsAt(G, x, y).filter(u => u.owner === player.id);
+        if (stackHere.length > 1) {
+          const idx = stackHere.findIndex(u => u.id === unit.id);
+          G.selectedUnitId = stackHere[(idx + 1) % stackHere.length].id;
+        } else {
+          G.selectedUnitId = null;
+        }
         render(); renderSelection();
         return;
       }
     }
 
-    const acted = tryMoveOrAct(G, unit, x, y);
-    if (acted) {
-      checkWinCondition(G);
-      if (G.gameOver) { showGameOver(); return; }
-      if (unit.dead || unit.movesLeft <= 0 && unit.attacksLeft <= 0) G.selectedUnitId = null;
-    } else if (!occupant && cityHere && cityHere.owner === player.id) {
-      // Out of reach for the selected unit: fall back to selecting the city itself.
-      G.selectedUnitId = null;
+    if (occupant && occupant.owner === player.id) {
+      G.selectedUnitId = occupant.id;
+      G.selectedCityId = null;
+    } else if (cityHere && cityHere.owner === player.id) {
       G.selectedCityId = cityHere.id;
+      G.selectedUnitId = null;
+    } else {
+      G.selectedUnitId = null;
+      G.selectedCityId = null;
     }
-    render(); renderSelection(); renderLog();
+    render(); renderSelection();
   }
 
   // Drag-and-drop a unit onto a tile. Tries to act immediately (move/attack/
@@ -1960,6 +1935,9 @@
       unit.patrol = null;
       unit.moveOrder = { x: tx, y: ty };
       log(G, `${nameOf(unit)} will move to (${tx}, ${ty}) once it can.`);
+      // Start covering ground toward it right away with any moves left this
+      // turn, rather than waiting for the next turn to begin making progress.
+      stepMoveOrder(G, unit);
     }
     render(); renderSelection(); renderLog();
   }
