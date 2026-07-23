@@ -514,6 +514,16 @@
     if (cityAt(s, x, y)) return enemyUnitAt(s, x, y, moverOwner);
     return unitAt(s, x, y);
   }
+  // An occupied enemy city can't just be strolled into like an easy, free
+  // neutral one -- taking it costs an attack (same resource as fighting a
+  // defender), so without one left this turn the tile is off-limits until
+  // the attack resets. Neutral cities are never gated by this.
+  function captureBlockedAt(s, unit, x, y) {
+    const def = UNIT_DEFS[unit.type];
+    if (!def.canCapture) return false;
+    const c = cityAt(s, x, y);
+    return !!(c && c.owner !== unit.owner && c.owner !== 'neutral' && unit.attacksLeft <= 0);
+  }
   function playerOf(s, id) { return s.players.find(p => p.id === id); }
   function otherPlayerId(id) { return id === 'p1' ? 'p2' : 'p1'; }
 
@@ -645,7 +655,7 @@
         const k = key(nx, ny);
         if (dist.has(k) && dist.get(k) <= nd) continue;
         if (!tilePassableForDomain(s, nx, ny, domain, unit.owner)) continue;
-        const occupant = blockingUnitAt(s, nx, ny, unit.owner);
+        const occupant = blockingUnitAt(s, nx, ny, unit.owner) || captureBlockedAt(s, unit, nx, ny);
         dist.set(k, nd);
         if (!occupant) {
           result.set(k, { x: nx, y: ny, cost: nd, from: key(cx, cy) });
@@ -655,6 +665,75 @@
       }
     }
     return result;
+  }
+
+  // Same range BFS, but for the on-screen haze/preview only: a hidden enemy
+  // sitting on a still-unexplored tile must not carve a visible hole in the
+  // highlighted range (that would leak its position through fog of war), so
+  // blocking only counts on tiles the unit's owner has actually explored.
+  function reachableTilesForDisplay(s, unit) {
+    const def = UNIT_DEFS[unit.type];
+    const domain = def.domain;
+    const player = playerOf(s, unit.owner);
+    const start = key(unit.x, unit.y);
+    const dist = new Map([[start, 0]]);
+    const queue = [[unit.x, unit.y, 0]];
+    const result = new Map();
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+    while (queue.length) {
+      const [cx, cy, d] = queue.shift();
+      for (const [dx, dy] of dirs) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= s.w || ny >= s.h) continue;
+        const nd = d + 1;
+        if (nd > unit.movesLeft) continue;
+        const k = key(nx, ny);
+        if (dist.has(k) && dist.get(k) <= nd) continue;
+        if (!tilePassableForDomain(s, nx, ny, domain, unit.owner)) continue;
+        const occupant = player.explored.has(k)
+          ? (blockingUnitAt(s, nx, ny, unit.owner) || captureBlockedAt(s, unit, nx, ny))
+          : null;
+        dist.set(k, nd);
+        if (!occupant) {
+          result.set(k, { x: nx, y: ny, cost: nd, from: key(cx, cy) });
+          queue.push([nx, ny, nd]);
+        }
+      }
+    }
+    return result;
+  }
+
+  // Distance-limited reachability to one specific tile, exactly like
+  // reachableTiles, except the destination tile itself is never treated as
+  // blocking. Used for flying an aircraft onto a carrier from anywhere in
+  // range: every tile along the way still has to be genuinely reachable,
+  // but the carrier sitting on the landing tile shouldn't count as an
+  // obstacle the way it would for a normal move there. Returns the move
+  // cost to reach (tx,ty), or null if it's out of range this turn.
+  function reachableIgnoringTarget(s, unit, tx, ty) {
+    const def = UNIT_DEFS[unit.type];
+    const domain = def.domain;
+    if (unit.x === tx && unit.y === ty) return 0;
+    const dist = new Map([[key(unit.x, unit.y), 0]]);
+    const queue = [[unit.x, unit.y, 0]];
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+    while (queue.length) {
+      const [cx, cy, d] = queue.shift();
+      for (const [dx, dy] of dirs) {
+        const nx = cx + dx, ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= s.w || ny >= s.h) continue;
+        const nd = d + 1;
+        if (nd > unit.movesLeft) continue;
+        const k = key(nx, ny);
+        if (dist.has(k) && dist.get(k) <= nd) continue;
+        if (!tilePassableForDomain(s, nx, ny, domain, unit.owner)) continue;
+        const isTarget = nx === tx && ny === ty;
+        dist.set(k, nd);
+        if (isTarget) return nd;
+        if (!blockingUnitAt(s, nx, ny, unit.owner) && !captureBlockedAt(s, unit, nx, ny)) queue.push([nx, ny, nd]);
+      }
+    }
+    return null;
   }
 
   function attackableTargets(s, unit) {
@@ -673,6 +752,19 @@
       }
     }
     return targets;
+  }
+
+  // Same computation as attackableTargets, but for on-screen indicators only
+  // (the ready/done dot, the attack-range highlight): a hidden enemy the
+  // player can't currently see must not be counted there, or it leaks the
+  // presence of something invisible through an otherwise-unexplained green
+  // dot or red highlight -- the same fog-of-war leak fixed earlier for the
+  // range haze. Actually attacking (and the AI) still use the true version,
+  // since choosing to strike a specific tile is a deliberate player action.
+  function attackableTargetsForDisplay(s, unit) {
+    const player = playerOf(s, unit.owner);
+    return attackableTargets(s, unit).filter(t =>
+      player.visible.has(key(t.x, t.y)) && !UNIT_DEFS[t.unit.type].stealth);
   }
 
   /* ---------------------------------------------------------------------
@@ -751,6 +843,76 @@
   }
 
   /* ---------------------------------------------------------------------
+   * Visual-only move animation
+   * ------------------------------------------------------------------- */
+  // Game state (position, moves, fuel, combat) is always resolved instantly
+  // and synchronously, exactly as before -- a whole patrol bounce or AI turn
+  // completes in one tick. This layer only smooths what render() draws: each
+  // tile hop queued here plays out over ANIM_SEG_MS before the next one
+  // starts, so a multi-step patrol/move-order/AI path visibly hops tile by
+  // tile instead of the sprite silently teleporting to its final resting
+  // tile. unitAnimQueue holds waypoints still waiting to play; unitAnimCurrent
+  // holds the segment actively being interpolated right now.
+  const ANIM_SEG_MS = 110;
+  const unitAnimQueue = new Map();   // unitId -> [{x,y}, ...] upcoming waypoints
+  const unitAnimCurrent = new Map(); // unitId -> { from:{x,y}, to:{x,y}, start:ms }
+  let animLoopActive = false;
+
+  function queueMoveAnim(unit, fromX, fromY, toX, toY) {
+    if (unitAnimCurrent.has(unit.id)) {
+      let q = unitAnimQueue.get(unit.id);
+      if (!q) { q = []; unitAnimQueue.set(unit.id, q); }
+      q.push({ x: toX, y: toY });
+    } else {
+      unitAnimCurrent.set(unit.id, { from: { x: fromX, y: fromY }, to: { x: toX, y: toY }, start: performance.now() });
+    }
+    if (!animLoopActive) {
+      animLoopActive = true;
+      requestAnimationFrame(animStep);
+    }
+  }
+
+  function animStep() {
+    const now = performance.now();
+    let stillGoing = false;
+    for (const [unitId, cur] of Array.from(unitAnimCurrent.entries())) {
+      if (!G || !G.units.some(u => u.id === unitId)) { unitAnimCurrent.delete(unitId); unitAnimQueue.delete(unitId); continue; }
+      if (now - cur.start >= ANIM_SEG_MS) {
+        const q = unitAnimQueue.get(unitId);
+        if (q && q.length) {
+          const next = q.shift();
+          unitAnimCurrent.set(unitId, { from: cur.to, to: next, start: cur.start + ANIM_SEG_MS });
+          stillGoing = true;
+        } else {
+          unitAnimCurrent.delete(unitId);
+        }
+      } else {
+        stillGoing = true;
+      }
+    }
+    if (G) render();
+    if (stillGoing) {
+      requestAnimationFrame(animStep);
+    } else {
+      animLoopActive = false;
+    }
+  }
+
+  // Whether `unitId` currently has an animation in flight or queued -- used
+  // by render() to skip drawing it as a settled tile occupant (it isn't
+  // visually there yet) in favor of the floating animated sprite.
+  function unitIsAnimating(unitId) {
+    return unitAnimCurrent.has(unitId) || (unitAnimQueue.get(unitId) || []).length > 0;
+  }
+
+  function animatedPos(unitId) {
+    const cur = unitAnimCurrent.get(unitId);
+    if (!cur) return null;
+    const t = Math.min(1, (performance.now() - cur.start) / ANIM_SEG_MS);
+    return { x: cur.from.x + (cur.to.x - cur.from.x) * t, y: cur.from.y + (cur.to.y - cur.from.y) * t };
+  }
+
+  /* ---------------------------------------------------------------------
    * Movement execution (handles capture / load / unload)
    * ------------------------------------------------------------------- */
   // `path`, if given, is the ordered list of tiles ([x,y] pairs) actually
@@ -782,7 +944,11 @@
       steps = Math.max(dx, dy);
       unit.movesLeft = Math.max(0, unit.movesLeft - steps);
     }
+    if (unit.x !== x || unit.y !== y) queueMoveAnim(unit, unit.x, unit.y, x, y);
     unit.x = x; unit.y = y;
+    // Cargo travels with its carrier -- keep boarded fighters/helicopters'
+    // stored position in lockstep rather than stale at wherever they boarded.
+    if (def.capacity > 0) for (const cargoUnit of unit.cargo) { cargoUnit.x = x; cargoUnit.y = y; }
 
     if (def.fuel > 0 && steps > 0) {
       const tiles = (path && path.length) ? path : [[x, y]];
@@ -801,6 +967,11 @@
     const c = cityAt(s, x, y);
     if (c && def.canCapture && c.owner !== unit.owner) {
       const wasNeutral = c.owner === 'neutral';
+      // Neutral cities are a free walk-in; an occupied enemy one still
+      // costs an attack even with no defender left to fight (callers only
+      // let a unit reach this tile once captureBlockedAt confirms it has
+      // one, so this is guaranteed to be available here).
+      if (!wasNeutral) unit.attacksLeft -= 1;
       c.owner = unit.owner;
       c.building = null;
       c.progress = 0;
@@ -846,12 +1017,15 @@
 
     // 2) Load friendly cargo from an adjacent tile. A stacked city might
     // have several friendly units on it, so pick the one that actually
-    // fits this transport/carrier.
+    // fits this transport/carrier. Bombers never roost as cargo -- they
+    // just pass over and refuel like any aircraft flying past a carrier
+    // (see isRefuelTile), so they're excluded here too.
     const cargoCandidate = def.capacity > 0 && dist === 1 && unit.cargo.length < def.capacity
-      ? unitsAt(s, tx, ty).find(u => u.owner === unit.owner && UNIT_DEFS[u.type].domain === def.cargoType)
+      ? unitsAt(s, tx, ty).find(u => u.owner === unit.owner && UNIT_DEFS[u.type].domain === def.cargoType && !UNIT_DEFS[u.type].singleUse)
       : null;
     if (cargoCandidate) {
       cargoCandidate.embarked = true;
+      cargoCandidate.x = unit.x; cargoCandidate.y = unit.y;
       unit.cargo.push(cargoCandidate);
       unit.movesLeft = Math.max(0, unit.movesLeft - 1);
       // Landing on a carrier tops off an aircraft's fuel.
@@ -861,17 +1035,32 @@
       return true;
     }
 
-    // 2b) Board a friendly transport/carrier standing on an adjacent tile --
-    // the reverse gesture from #2 (dragging the cargo unit itself onto the
-    // carrier instead of the carrier onto it).
-    const carrierCandidate = def.capacity === 0 && dist === 1
-      ? unitsAt(s, tx, ty).find(u => u.owner === unit.owner && UNIT_DEFS[u.type].capacity > 0 &&
-          UNIT_DEFS[u.type].cargoType === def.domain && u.cargo.length < UNIT_DEFS[u.type].capacity)
-      : null;
+    // 2b) Board a friendly transport/carrier -- the reverse gesture from #2
+    // (dragging the cargo unit itself onto the carrier instead of the
+    // carrier onto it). A land unit walking up to a transport still has to
+    // be adjacent (it can't enter the sea tile itself), but an aircraft can
+    // fly straight onto a carrier's tile from anywhere within range, same as
+    // any other flight. Bombers don't board this way -- they only refuel.
+    let carrierCandidate = null;
+    let carrierBoardCost = 1;
+    if (def.capacity === 0 && !def.singleUse) {
+      const findCandidate = (x, y) => unitsAt(s, x, y).find(u => u.owner === unit.owner && UNIT_DEFS[u.type].capacity > 0 &&
+        UNIT_DEFS[u.type].cargoType === def.domain && u.cargo.length < UNIT_DEFS[u.type].capacity);
+      if (dist === 1) {
+        carrierCandidate = findCandidate(tx, ty);
+      } else if (def.domain === 'air') {
+        const candidate = findCandidate(tx, ty);
+        if (candidate) {
+          const cost = reachableIgnoringTarget(s, unit, tx, ty);
+          if (cost != null) { carrierCandidate = candidate; carrierBoardCost = cost; }
+        }
+      }
+    }
     if (carrierCandidate) {
       unit.embarked = true;
+      unit.x = carrierCandidate.x; unit.y = carrierCandidate.y;
       carrierCandidate.cargo.push(unit);
-      unit.movesLeft = Math.max(0, unit.movesLeft - 1);
+      unit.movesLeft = Math.max(0, unit.movesLeft - carrierBoardCost);
       // Boarding a carrier tops off an aircraft's fuel.
       if (def.domain === 'air') unit.fuel = def.fuel;
       log(s, `${nameOf(unit)} boarded ${nameOf(carrierCandidate)}.`);
@@ -882,6 +1071,7 @@
     // 3) Unload cargo onto an adjacent compatible tile (a friendly city can
     // already hold units and still accept the disembark).
     if (def.capacity > 0 && !blockingUnitAt(s, tx, ty, unit.owner) && unit.cargo.length > 0 && dist === 1 &&
+        !captureBlockedAt(s, unit.cargo[0], tx, ty) &&
         tilePassableForDomain(s, tx, ty, UNIT_DEFS[unit.cargo[0].type].domain, unit.owner)) {
       const cargoUnit = unit.cargo.shift();
       cargoUnit.embarked = false;
@@ -1041,7 +1231,7 @@
         if (unit.attacksLeft > 0) { unit.attacksLeft -= 1; resolveAttack(s, unit, enemy); }
         return;
       }
-      if (blockingUnitAt(s, nx, ny, unit.owner)) return;
+      if (blockingUnitAt(s, nx, ny, unit.owner) || captureBlockedAt(s, unit, nx, ny)) return;
       moveUnitTo(s, unit, nx, ny, false);
       if (unit.dead) return; // e.g. an aircraft that just ran out of fuel
       steps++;
@@ -1431,6 +1621,96 @@
     }
   }
 
+  // Draws one unit's chip (glyph + veteran/turn-state/stack/cargo badges) at
+  // an explicit screen pixel position. Factored out of the main per-tile
+  // loop so the same rendering can also be used for a unit mid-animation,
+  // floating at an interpolated position between tiles instead of sitting
+  // still on its resting tile's grid square.
+  function drawUnitChip(ctx, u, px, py, opts) {
+    opts = opts || {};
+    ctx.save();
+    const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
+    const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
+    const chipGrad = ctx.createLinearGradient(px + 2, py + 2, px + TILE_PX - 2, py + TILE_PX - 2);
+    chipGrad.addColorStop(0, light);
+    chipGrad.addColorStop(1, dark);
+    roundRectPath(ctx, px + 2, py + 2, TILE_PX - 4, TILE_PX - 4, Math.max(2, TILE_PX * 0.18));
+    ctx.fillStyle = chipGrad;
+    ctx.fill();
+    ctx.strokeStyle = opts.selected ? '#f2c14e' : 'rgba(0,0,0,0.65)';
+    ctx.lineWidth = opts.selected ? 2 : 1;
+    ctx.stroke();
+    ctx.save();
+    ctx.translate(px + TILE_PX / 2, py + TILE_PX / 2);
+    // Soft drop shadow beneath the glyph for a slight embossed look.
+    ctx.save();
+    ctx.translate(TILE_PX * 0.05, TILE_PX * 0.07);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+    drawUnitGlyph(ctx, u.type, TILE_PX * 0.42);
+    ctx.restore();
+    const iconGrad = ctx.createLinearGradient(-TILE_PX * 0.42, -TILE_PX * 0.42, TILE_PX * 0.42, TILE_PX * 0.42);
+    iconGrad.addColorStop(0, '#ffffff');
+    iconGrad.addColorStop(1, '#c7ced6');
+    ctx.fillStyle = iconGrad;
+    ctx.strokeStyle = '#16181c';
+    ctx.lineWidth = 1;
+    drawUnitGlyph(ctx, u.type, TILE_PX * 0.42);
+    ctx.restore();
+    if (u.veteran) {
+      ctx.fillStyle = '#f2c14e';
+      ctx.beginPath();
+      ctx.arc(px + TILE_PX - 3, py + 3, 1.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    if (opts.trackTurnState) {
+      ctx.fillStyle = opts.hasActionsLeft ? '#3ddc71' : '#e0453b';
+      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(px + 3, py + TILE_PX - 3, Math.max(1.6, TILE_PX * 0.07), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (opts.stackCount > 1) {
+      // A stacked city garrison: a small badge with the count, so a pile
+      // of units doesn't just look like a single one.
+      const r = Math.max(4, TILE_PX * 0.18);
+      ctx.fillStyle = 'rgba(20,22,26,0.9)';
+      ctx.beginPath();
+      ctx.arc(px + r + 1, py + r + 1, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#f2c14e';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = '#f2c14e';
+      ctx.font = `bold ${Math.max(7, Math.round(TILE_PX * 0.32))}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(opts.stackCount), px + r + 1, py + r + 2);
+    }
+    if (UNIT_DEFS[u.type].capacity > 0 && u.cargo.length > 0) {
+      // A transport/carrier holding cargo: same badge treatment as a
+      // stacked garrison, but in the opposite corner so the two counts
+      // (units sharing this tile vs. units riding this one) never clash.
+      const r = Math.max(4, TILE_PX * 0.18);
+      const bx = px + TILE_PX - r - 1, by = py + TILE_PX - r - 1;
+      ctx.fillStyle = 'rgba(20,22,26,0.9)';
+      ctx.beginPath();
+      ctx.arc(bx, by, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#f2c14e';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.fillStyle = '#f2c14e';
+      ctx.font = `bold ${Math.max(7, Math.round(TILE_PX * 0.32))}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(u.cargo.length), bx, by + 1);
+    }
+  }
+
   function render() {
     if (!G) return;
     clampCamera();
@@ -1535,15 +1815,19 @@
       if (!isMineOrig && UNIT_DEFS[uOrig.type].stealth) continue; // subs invisible unless caught elsewhere
       if (drawnUnitTiles.has(k)) continue;
       drawnUnitTiles.add(k);
-      const stackHere = G.units.filter(u2 => {
+      const stackHereAll = G.units.filter(u2 => {
         if (u2.embarked || u2.x !== uOrig.x || u2.y !== uOrig.y) return false;
         const mine2 = u2.owner === player.id;
         if (!mine2 && !player.visible.has(k)) return false;
         if (!mine2 && UNIT_DEFS[u2.type].stealth) return false;
         return true;
       });
+      // A unit currently animating a hop isn't visually "here" yet -- the
+      // floating overlay pass below draws it mid-flight instead, so it's
+      // excluded from this tile's representative sprite and stack count.
+      const stackHere = stackHereAll.filter(u2 => !unitIsAnimating(u2.id));
+      if (stackHere.length === 0) continue;
       const u = stackHere.find(u2 => u2.id === G.selectedUnitId) || stackHere[0];
-      const isMine = u.owner === player.id;
       const tx = u.x - G.camera.x, ty = u.y - G.camera.y;
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
@@ -1552,84 +1836,45 @@
       // are truly done (red dot): out of moves, and either out of attacks or
       // with no enemy actually in range to attack.
       const trackTurnState = u.owner === player.id && player.kind === 'human';
-      const canStillAttack = u.attacksLeft > 0 && attackableTargets(G, u).length > 0;
+      const canStillAttack = u.attacksLeft > 0 && attackableTargetsForDisplay(G, u).length > 0;
       const hasActionsLeft = u.movesLeft > 0 || canStillAttack;
-      ctx.save();
-      const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
-      const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
-      const chipGrad = ctx.createLinearGradient(px + 2, py + 2, px + TILE_PX - 2, py + TILE_PX - 2);
-      chipGrad.addColorStop(0, light);
-      chipGrad.addColorStop(1, dark);
-      roundRectPath(ctx, px + 2, py + 2, TILE_PX - 4, TILE_PX - 4, Math.max(2, TILE_PX * 0.18));
-      ctx.fillStyle = chipGrad;
-      ctx.fill();
-      ctx.strokeStyle = (G.selectedUnitId === u.id) ? '#f2c14e' : 'rgba(0,0,0,0.65)';
-      ctx.lineWidth = (G.selectedUnitId === u.id) ? 2 : 1;
-      ctx.stroke();
-      ctx.save();
-      ctx.translate(px + TILE_PX / 2, py + TILE_PX / 2);
-      // Soft drop shadow beneath the glyph for a slight embossed look.
-      ctx.save();
-      ctx.translate(TILE_PX * 0.05, TILE_PX * 0.07);
-      ctx.fillStyle = 'rgba(0,0,0,0.35)';
-      ctx.strokeStyle = 'rgba(0,0,0,0.35)';
-      drawUnitGlyph(ctx, u.type, TILE_PX * 0.42);
-      ctx.restore();
-      const iconGrad = ctx.createLinearGradient(-TILE_PX * 0.42, -TILE_PX * 0.42, TILE_PX * 0.42, TILE_PX * 0.42);
-      iconGrad.addColorStop(0, '#ffffff');
-      iconGrad.addColorStop(1, '#c7ced6');
-      ctx.fillStyle = iconGrad;
-      ctx.strokeStyle = '#16181c';
-      ctx.lineWidth = 1;
-      drawUnitGlyph(ctx, u.type, TILE_PX * 0.42);
-      ctx.restore();
-      if (u.veteran) {
-        ctx.fillStyle = '#f2c14e';
-        ctx.beginPath();
-        ctx.arc(px + TILE_PX - 3, py + 3, 1.6, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      ctx.restore();
-      if (trackTurnState) {
-        ctx.fillStyle = hasActionsLeft ? '#3ddc71' : '#e0453b';
-        ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.arc(px + 3, py + TILE_PX - 3, Math.max(1.6, TILE_PX * 0.07), 0, Math.PI * 2);
-        ctx.fill();
-        ctx.stroke();
-      }
-      if (stackHere.length > 1) {
-        // A stacked city garrison: a small badge with the count, so a pile
-        // of units doesn't just look like a single one.
-        const r = Math.max(4, TILE_PX * 0.18);
-        ctx.fillStyle = 'rgba(20,22,26,0.9)';
-        ctx.beginPath();
-        ctx.arc(px + r + 1, py + r + 1, r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = '#f2c14e';
-        ctx.lineWidth = 1;
-        ctx.stroke();
-        ctx.fillStyle = '#f2c14e';
-        ctx.font = `bold ${Math.max(7, Math.round(TILE_PX * 0.32))}px monospace`;
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(String(stackHere.length), px + r + 1, py + r + 2);
-      }
+      drawUnitChip(ctx, u, px, py, {
+        selected: G.selectedUnitId === u.id,
+        trackTurnState,
+        hasActionsLeft,
+        stackCount: stackHere.length,
+      });
+    }
+
+    // Floating overlay: units mid-hop through a patrol/move-order/multi-tile
+    // path, drawn at their interpolated position instead of snapping
+    // straight to the destination tile. Same visibility rules as the
+    // settled-unit pass above, so an animation never reveals a unit the
+    // player couldn't already see.
+    for (const u of G.units) {
+      if (u.embarked || !unitIsAnimating(u.id)) continue;
+      const isMine = u.owner === player.id;
+      if (!isMine && !player.visible.has(key(u.x, u.y))) continue;
+      if (!isMine && UNIT_DEFS[u.type].stealth) continue;
+      const pos = animatedPos(u.id);
+      if (!pos) continue;
+      const tx = pos.x - G.camera.x, ty = pos.y - G.camera.y;
+      if (tx < -1 || ty < -1 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
+      drawUnitChip(ctx, u, tx * TILE_PX, ty * TILE_PX, { selected: G.selectedUnitId === u.id });
     }
 
     // Selection overlays: reachable & attackable tiles
     if (G.selectedUnitId != null) {
       const unit = G.units.find(u => u.id === G.selectedUnitId);
       if (unit && unit.owner === player.id) {
-        const reach = reachableTiles(G, unit);
+        const reach = reachableTilesForDisplay(G, unit);
         ctx.fillStyle = 'rgba(242,193,78,0.25)';
         for (const r of reach.values()) {
           const tx = r.x - G.camera.x, ty = r.y - G.camera.y;
           if (tx < 0 || ty < 0) continue;
           ctx.fillRect(tx*TILE_PX, ty*TILE_PX, TILE_PX, TILE_PX);
         }
-        const atk = attackableTargets(G, unit);
+        const atk = attackableTargetsForDisplay(G, unit);
         ctx.fillStyle = 'rgba(224,69,59,0.35)';
         for (const t of atk) {
           const tx = t.x - G.camera.x, ty = t.y - G.camera.y;
@@ -1685,7 +1930,7 @@
       const dragUnit = G.units.find(u => u.id === unitDragId);
       if (dragUnit && unitDragTile) {
         const atDestination = dragUnit.x === unitDragTile.x && dragUnit.y === unitDragTile.y;
-        const reach = reachableTiles(G, dragUnit);
+        const reach = reachableTilesForDisplay(G, dragUnit);
         const entry = reach.get(key(unitDragTile.x, unitDragTile.y));
         const reachable = atDestination || !!entry;
         const distance = atDestination ? 0 : (entry ? entry.cost : chebyshev(dragUnit.x, dragUnit.y, unitDragTile.x, unitDragTile.y));
@@ -2024,8 +2269,13 @@
     if (player.kind !== 'human') return;
     const { x, y } = eventTile(e);
     if (x < 0 || y < 0 || x >= G.w || y >= G.h) return;
-    const occ = unitAt(G, x, y);
-    if (occ && occ.owner === player.id) {
+    // Prefer whichever unit is already selected if it's part of the stack
+    // here -- otherwise a mousedown on a stacked tile always grabs the
+    // first unit in creation order, even after clicking to select/cycle to
+    // a different one (e.g. a Fighter stacked behind an Army in a city).
+    const stackHere = unitsAt(G, x, y).filter(u => u.owner === player.id);
+    const occ = stackHere.find(u => u.id === G.selectedUnitId) || stackHere[0];
+    if (occ) {
       unitDragId = occ.id;
       unitDragTile = { x, y };
       unitDragMoved = false;
