@@ -845,8 +845,11 @@
         // (and capture, if it's a city) once the last one is gone.
         const stillDefended = !!enemyUnitAt(s, defender.x, defender.y, attacker.owner);
         if (!stillDefended && (atkDef.canCapture || (targetCity && atkDef.domain !== 'sea'))) {
-          // Land forces occupy the now-empty tile; if it is a city, capture it.
-          if (atkDef.domain === 'land') {
+          // Land forces occupy the now-empty tile; if it is a city, capture
+          // it. But only if the tile is actually passable for them --
+          // destroying a ship out on open water doesn't let a land unit
+          // walk onto the ocean; it stays put on its own square.
+          if (atkDef.domain === 'land' && tilePassableForDomain(s, defender.x, defender.y, atkDef.domain, attacker.owner)) {
             moveUnitTo(s, attacker, defender.x, defender.y, true);
           }
         }
