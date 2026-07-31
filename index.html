@@ -73,6 +73,13 @@
   #top-bar .turn-indicator.p1 { color: var(--p1); }
   #top-bar .turn-indicator.p2 { color: var(--p2); }
   #top-bar .spacer { flex: 1; }
+  #debug-panel {
+    display: flex; flex-direction: column; gap: 6px;
+    background: #2a1520; border-bottom: 1px solid #6b2b3f;
+    padding: 8px 14px; flex-shrink: 0; font-size: 12px;
+  }
+  #debug-panel .debug-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  #debug-panel label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
   #main-area { display: flex; flex: 1; min-height: 0; }
   #map-canvas { background: var(--sea-dim); display: block; cursor: crosshair; }
   #canvas-wrap { flex: 1; position: relative; overflow: hidden; }
@@ -152,6 +159,7 @@
       </select>
     </div>
 
+    <button id="continue-btn" class="primary hidden" style="margin-bottom:8px;">Continue Saved Game</button>
     <button id="start-btn" class="primary">Start Game</button>
 
     <div class="setup-note">
@@ -171,7 +179,23 @@
     <button id="zoom-out-btn" title="Zoom out">&minus;</button>
     <button id="zoom-in-btn" title="Zoom in">+</button>
     <button id="help-btn">Unit Guide</button>
+    <button id="debug-btn" title="Debug tools">Debug</button>
     <button id="end-turn-btn" class="primary" title="End Turn (Enter)">End Turn</button>
+  </div>
+  <div id="debug-panel" class="hidden">
+    <div class="debug-row">
+      <label><input type="checkbox" id="debug-fog-toggle"> Reveal fog of war</label>
+      <label><input type="checkbox" id="debug-freemove-toggle"> Free move (any piece, ignores rules)</label>
+    </div>
+    <div class="debug-row">
+      <span>Add unit:</span>
+      <select id="debug-owner-select">
+        <option value="p1">Blue</option>
+        <option value="p2">Red</option>
+      </select>
+      <select id="debug-unittype-select"></select>
+      <button id="debug-place-btn">Place&hellip;</button>
+    </div>
   </div>
   <div id="main-area">
     <div id="canvas-wrap">
@@ -478,6 +502,9 @@
       gameOver: false,
       lastSurrenderOfferTurn: null,
       pendingSurrenderOffer: false,
+      debugFreeMove: false,
+      debugPlacingUnit: null,
+      debugSavedFog: null,
     };
     // Starting garrison: one Army in each player's home city. Human-owned
     // home cities start idle so the player picks their own opening
@@ -492,6 +519,70 @@
       }
     }
     return state;
+  }
+
+  /* ---------------------------------------------------------------------
+   * Save / load (persists the active game to the browser's local storage
+   * so it survives closing the tab -- "saved on disk" from the player's
+   * point of view). Sets aren't JSON-safe, and cargo arrays hold direct
+   * object references to entries already present in `units` (so a naive
+   * JSON round-trip would silently fork those into unlinked duplicates) --
+   * both are normalized on the way out and reconstructed on the way in.
+   * ------------------------------------------------------------------- */
+  const SAVE_KEY = 'strategicConquest.save.v1';
+
+  function serializeGame(s) {
+    return {
+      w: s.w, h: s.h, terrain: s.terrain, cities: s.cities,
+      units: s.units.map(u => ({ ...u, cargo: u.cargo.map(c => c.id) })),
+      nextUnitId: s.nextUnitId,
+      players: s.players.map(p => ({
+        id: p.id, kind: p.kind, color: p.color, name: p.name,
+        explored: Array.from(p.explored), visible: Array.from(p.visible),
+      })),
+      turnNumber: s.turnNumber, currentPlayerIndex: s.currentPlayerIndex,
+      difficulty: s.difficulty, log: s.log, camera: s.camera,
+      gameOver: s.gameOver, winner: s.winner,
+      lastSurrenderOfferTurn: s.lastSurrenderOfferTurn,
+    };
+  }
+
+  function deserializeGame(data) {
+    const s = {
+      w: data.w, h: data.h, terrain: data.terrain, cities: data.cities,
+      units: data.units.map(u => ({ ...u, cargo: [] })),
+      nextUnitId: data.nextUnitId,
+      players: data.players.map(p => ({ ...p, explored: new Set(p.explored), visible: new Set(p.visible) })),
+      turnNumber: data.turnNumber, currentPlayerIndex: data.currentPlayerIndex,
+      difficulty: data.difficulty, log: data.log, camera: data.camera,
+      selectedUnitId: null, selectedCityId: null, patrolPickUnitId: null,
+      gameOver: data.gameOver, winner: data.winner,
+      lastSurrenderOfferTurn: data.lastSurrenderOfferTurn, pendingSurrenderOffer: false,
+      debugFreeMove: false, debugPlacingUnit: null, debugSavedFog: null,
+    };
+    for (const u of data.units) {
+      if (!u.cargo.length) continue;
+      s.units.find(x => x.id === u.id).cargo = u.cargo.map(cid => s.units.find(x => x.id === cid));
+    }
+    return s;
+  }
+
+  function saveGameToDisk() {
+    if (!G || G.debugSavedFog) return; // don't persist a debug fog-reveal snapshot
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(serializeGame(G)));
+    } catch (e) { /* storage unavailable/full -- autosave is best-effort */ }
+  }
+
+  function loadGameFromDisk() {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      return raw ? deserializeGame(JSON.parse(raw)) : null;
+    } catch (e) { return null; }
+  }
+
+  function clearSavedGame() {
+    try { localStorage.removeItem(SAVE_KEY); } catch (e) {}
   }
 
   function terrainAt(s, x, y) {
@@ -785,10 +876,35 @@
   // pierces that -- within the destroyer's own vision radius, the sub is
   // revealed just like any other unit.
   function isStealthDetected(s, unit, byOwner) {
+    if (s.debugSavedFog) return true; // debug fog reveal shows everything, subs included
     if (!UNIT_DEFS[unit.type].stealth) return true; // nothing to detect
     return s.units.some(u => u.owner === byOwner && !u.embarked &&
       UNIT_DEFS[u.type].detectsSubs &&
       chebyshev(u.x, u.y, unit.x, unit.y) <= UNIT_DEFS[u.type].vision);
+  }
+
+  // Debug tool: reveals the whole map (terrain, cities, units) for both
+  // sides by snapshotting each player's real explored/visible sets and
+  // replacing them with "everything" -- restoring the snapshot on toggle-off
+  // so real fog-of-war progress isn't lost.
+  function setDebugRevealAll(s, on) {
+    if (on) {
+      if (s.debugSavedFog) return; // already revealed
+      s.debugSavedFog = s.players.map(p => ({ id: p.id, explored: p.explored, visible: p.visible }));
+      const all = new Set();
+      for (let y = 0; y < s.h; y++) for (let x = 0; x < s.w; x++) all.add(key(x, y));
+      for (const p of s.players) { p.explored = new Set(all); p.visible = new Set(all); }
+    } else {
+      if (!s.debugSavedFog) return;
+      for (const saved of s.debugSavedFog) {
+        const p = playerOf(s, saved.id);
+        p.explored = saved.explored;
+        p.visible = saved.visible;
+      }
+      s.debugSavedFog = null;
+      recomputeVisibility(s, s.players[0]);
+      recomputeVisibility(s, s.players[1]);
+    }
   }
 
   /* ---------------------------------------------------------------------
@@ -2283,6 +2399,17 @@
     const occupant = unitAt(G, x, y);
     const cityHere = cityAt(G, x, y);
 
+    if (G.debugPlacingUnit) {
+      const { owner, type } = G.debugPlacingUnit;
+      const u = spawnUnit(G, type, owner, x, y);
+      log(G, `[DEBUG] Placed a ${UNIT_DEFS[type].name} for ${owner === 'p1' ? 'Blue' : 'Red'}.`);
+      recomputeVisibility(G, playerOf(G, owner));
+      G.selectedUnitId = u.id;
+      G.selectedCityId = null;
+      render(); renderSelection(); renderLog();
+      return;
+    }
+
     if (G.patrolPickUnitId != null) {
       const punit = G.units.find(u => u.id === G.patrolPickUnitId);
       G.patrolPickUnitId = null;
@@ -2335,6 +2462,16 @@
   // making progress on its own once moves are available.
   function handleUnitDragDrop(unitId, tx, ty) {
     const player = activePlayer();
+    if (G.debugFreeMove) {
+      // Debug tool: teleport any piece anywhere, bypassing moves/terrain/
+      // ownership rules entirely.
+      const unit = G.units.find(u => u.id === unitId);
+      if (!unit || (unit.x === tx && unit.y === ty)) return;
+      unit.x = tx; unit.y = ty;
+      recomputeVisibility(G, playerOf(G, unit.owner));
+      render(); renderSelection(); renderLog();
+      return;
+    }
     if (G.patrolPickUnitId != null) {
       const punit = G.units.find(u => u.id === G.patrolPickUnitId);
       G.patrolPickUnitId = null;
@@ -2423,7 +2560,7 @@
     // here -- otherwise a mousedown on a stacked tile always grabs the
     // first unit in creation order, even after clicking to select/cycle to
     // a different one (e.g. a Fighter stacked behind an Army in a city).
-    const stackHere = unitsAt(G, x, y).filter(u => u.owner === player.id);
+    const stackHere = G.debugFreeMove ? unitsAt(G, x, y) : unitsAt(G, x, y).filter(u => u.owner === player.id);
     const occ = stackHere.find(u => u.id === G.selectedUnitId) || stackHere[0];
     if (occ) {
       unitDragId = occ.id;
@@ -2484,7 +2621,8 @@
     if (!G || G.gameOver) return;
     const finishingPlayer = activePlayer();
     advanceToNextPlayer(G);
-    if (G.gameOver) { showGameOver(); return; }
+    if (G.gameOver) { clearSavedGame(); showGameOver(); return; }
+    saveGameToDisk();
     if (G.pendingSurrenderOffer) { showSurrenderOffer(); return; }
     const nextPlayer = activePlayer();
     if (nextPlayer.kind === 'human' && finishingPlayer.kind === 'human' && finishingPlayer.id !== nextPlayer.id) {
@@ -2521,10 +2659,12 @@
     render(); renderLog();
   }
   document.getElementById('restart-btn').addEventListener('click', () => {
+    clearSavedGame();
     gameoverOverlay.classList.add('hidden');
     document.getElementById('game-screen').classList.remove('active');
     document.getElementById('game-screen').style.display = 'none';
     document.getElementById('setup-screen').style.display = 'flex';
+    document.getElementById('continue-btn').classList.add('hidden');
     G = null;
   });
 
@@ -2542,12 +2682,51 @@
     G.gameOver = true;
     G.winner = 'p1';
     surrenderOverlay.classList.add('hidden');
+    clearSavedGame();
     showGameOver(`${aiPlayer.name} has surrendered. You win!`);
   });
   document.getElementById('surrender-decline-btn').addEventListener('click', () => {
     G.pendingSurrenderOffer = false;
     surrenderOverlay.classList.add('hidden');
     finishTurnUI();
+  });
+
+  /* ---------------------------------------------------------------------
+   * Debug tools
+   * ------------------------------------------------------------------- */
+  const debugPanel = document.getElementById('debug-panel');
+  const debugUnitTypeSelect = document.getElementById('debug-unittype-select');
+  for (const uk of UNIT_ORDER) {
+    const opt = document.createElement('option');
+    opt.value = uk;
+    opt.textContent = UNIT_DEFS[uk].name;
+    debugUnitTypeSelect.appendChild(opt);
+  }
+  document.getElementById('debug-btn').addEventListener('click', () => {
+    debugPanel.classList.toggle('hidden');
+  });
+  document.getElementById('debug-fog-toggle').addEventListener('change', (e) => {
+    if (!G) return;
+    setDebugRevealAll(G, e.target.checked);
+    render(); renderSelection();
+  });
+  document.getElementById('debug-freemove-toggle').addEventListener('change', (e) => {
+    if (!G) return;
+    G.debugFreeMove = e.target.checked;
+  });
+  const debugPlaceBtn = document.getElementById('debug-place-btn');
+  debugPlaceBtn.addEventListener('click', () => {
+    if (!G) return;
+    if (G.debugPlacingUnit) {
+      G.debugPlacingUnit = null;
+      debugPlaceBtn.textContent = 'Place…';
+    } else {
+      G.debugPlacingUnit = {
+        owner: document.getElementById('debug-owner-select').value,
+        type: debugUnitTypeSelect.value,
+      };
+      debugPlaceBtn.textContent = 'Click a tile… (cancel)';
+    }
   });
 
   /* ---------------------------------------------------------------------
@@ -2607,7 +2786,23 @@
     if (homeCity) G.selectedCityId = homeCity.id;
     updateTurnIndicator();
     render(); renderSelection(); renderLog();
+    saveGameToDisk();
   });
+
+  document.getElementById('continue-btn').addEventListener('click', () => {
+    const loaded = loadGameFromDisk();
+    if (!loaded) return;
+    G = loaded;
+    document.getElementById('setup-screen').style.display = 'none';
+    document.getElementById('game-screen').style.display = 'flex';
+    document.getElementById('game-screen').classList.add('active');
+    resizeCanvas();
+    updateTurnIndicator();
+    render(); renderSelection(); renderLog();
+  });
+  if (loadGameFromDisk()) {
+    document.getElementById('continue-btn').classList.remove('hidden');
+  }
 
   resizeCanvas();
 })();
