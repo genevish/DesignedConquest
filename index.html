@@ -1844,6 +1844,7 @@
   // still on its resting tile's grid square.
   function drawUnitChip(ctx, u, px, py, opts) {
     opts = opts || {};
+    const hasCargoBadge = UNIT_DEFS[u.type].capacity > 0 && u.cargo.length > 0;
     ctx.save();
     const light = u.owner === 'p1' ? '#6ba5fb' : '#f28c7e';
     const dark = u.owner === 'p1' ? '#1d4d8f' : '#a3281f';
@@ -1891,13 +1892,25 @@
       ctx.fillText('Z', px + TILE_PX / 2, py + 1);
     }
     if (opts.trackTurnState) {
-      ctx.fillStyle = opts.hasActionsLeft ? '#3ddc71' : '#e0453b';
+      // Moves left -- bottom-left corner.
+      ctx.fillStyle = opts.hasMovesLeft ? '#3ddc71' : '#e0453b';
       ctx.strokeStyle = 'rgba(0,0,0,0.7)';
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.arc(px + 3, py + TILE_PX - 3, Math.max(1.6, TILE_PX * 0.07), 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
+      // Attacks left -- bottom-right corner, mirroring the moves dot. A
+      // cargo-count badge (transports/carriers currently holding cargo)
+      // already occupies that corner, so skip this dot then rather than
+      // overlapping it.
+      if (!hasCargoBadge) {
+        ctx.fillStyle = opts.hasAttacksLeft ? '#3ddc71' : '#e0453b';
+        ctx.beginPath();
+        ctx.arc(px + TILE_PX - 3, py + TILE_PX - 3, Math.max(1.6, TILE_PX * 0.07), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      }
     }
     if (opts.stackCount > 1) {
       // A stacked city garrison: a small badge with the count, so a pile
@@ -1916,7 +1929,7 @@
       ctx.textBaseline = 'middle';
       ctx.fillText(String(opts.stackCount), px + r + 1, py + r + 2);
     }
-    if (UNIT_DEFS[u.type].capacity > 0 && u.cargo.length > 0) {
+    if (hasCargoBadge) {
       // A transport/carrier holding cargo: same badge treatment as a
       // stacked garrison, but in the opposite corner so the two counts
       // (units sharing this tile vs. units riding this one) never clash.
@@ -2057,17 +2070,15 @@
       const tx = u.x - G.camera.x, ty = u.y - G.camera.y;
       if (tx < 0 || ty < 0 || tx * TILE_PX > canvas.width || ty * TILE_PX > canvas.height) continue;
       const px = tx * TILE_PX, py = ty * TILE_PX;
-      // For the side whose turn it is, make it obvious at a glance which of
-      // their units can still do something useful this turn (green dot) vs.
-      // are truly done (red dot): out of moves, and either out of attacks or
-      // with no enemy actually in range to attack.
+      // For the side whose turn it is, make it obvious at a glance whether
+      // this unit still has moves (bottom-left dot) and/or attacks
+      // (bottom-right dot) left this turn.
       const trackTurnState = u.owner === player.id && player.kind === 'human';
-      const canStillAttack = u.attacksLeft > 0 && attackableTargetsForDisplay(G, u).length > 0;
-      const hasActionsLeft = u.movesLeft > 0 || canStillAttack;
       drawUnitChip(ctx, u, px, py, {
         selected: G.selectedUnitId === u.id,
         trackTurnState,
-        hasActionsLeft,
+        hasMovesLeft: u.movesLeft > 0,
+        hasAttacksLeft: u.attacksLeft > 0,
         stackCount: stackHere.length,
       });
     }
@@ -2201,6 +2212,20 @@
   }
 
   function renderMinimap(player) {
+    // Keep the minimap out of the way of whatever part of the map is
+    // currently in view -- otherwise panning to a corner of the world puts
+    // the minimap directly on top of the terrain you're trying to look at.
+    // It always sits in the screen corner diagonally opposite whichever
+    // map quadrant the camera is centered on.
+    const tilesX = Math.floor(canvas.width / TILE_PX), tilesY = Math.floor(canvas.height / TILE_PX);
+    const viewCenterX = G.camera.x + tilesX / 2, viewCenterY = G.camera.y + tilesY / 2;
+    const onRightHalf = viewCenterX > G.w / 2;
+    const onBottomHalf = viewCenterY > G.h / 2;
+    minimap.style.left = onRightHalf ? '10px' : '';
+    minimap.style.right = onRightHalf ? '' : '10px';
+    minimap.style.top = onBottomHalf ? '10px' : '';
+    minimap.style.bottom = onBottomHalf ? '' : '10px';
+
     const scaleX = minimap.width / G.w, scaleY = minimap.height / G.h;
     mctx.fillStyle = '#000';
     mctx.fillRect(0, 0, minimap.width, minimap.height);
@@ -2217,8 +2242,6 @@
       mctx.fillStyle = c.owner === 'p1' ? '#3b82f6' : c.owner === 'p2' ? '#e0453b' : '#c9a227';
       mctx.fillRect(c.x*scaleX-1, c.y*scaleY-1, 3, 3);
     }
-    const tilesX = Math.floor(canvas.width / TILE_PX);
-    const tilesY = Math.floor(canvas.height / TILE_PX);
     mctx.strokeStyle = '#fff';
     mctx.strokeRect(G.camera.x*scaleX, G.camera.y*scaleY, tilesX*scaleX, tilesY*scaleY);
   }
